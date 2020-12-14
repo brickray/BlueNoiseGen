@@ -5,6 +5,7 @@
 #include "device_launch_parameters.h"
 #include <vector>
 #include <random>
+#include <string>
 #include <time.h>
 #include <Windows.h>
 
@@ -26,19 +27,20 @@ float Clamp(float V, float Min, float Max)
 	return V;
 }
 
-bool SavePng(const char* Filename, int Width, int Height, float* Input){
-	unsigned char* Transform = new unsigned char[Width*Height * 3];
+bool SavePng(const char* Filename, int Width, int Height, int Channels, float* Input){
+	unsigned char* Transform = new unsigned char[Width*Height*Channels];
 	for (int i = 0; i < Height; ++i){
 		for (int j = 0; j < Width; ++j){
 			unsigned Pixel = i*Width + j;
-			unsigned C = unsigned(Clamp(Input[Pixel], 0.f, 1.f)*255.f);
-			Transform[3 * Pixel] = C;
-			Transform[3 * Pixel + 1] = C;
-			Transform[3 * Pixel + 2] = C;
+			for (int c = 0; c < Channels; ++c)
+			{
+				unsigned C = unsigned(Clamp(Input[Channels * Pixel + c], 0.f, 1.f)*255.f);
+				Transform[Channels * Pixel + c] = C;
+			}
 		}
 	}
 
-	stbi_write_png(Filename, Width, Height, 3, Transform, 0);
+	stbi_write_png(Filename, Width, Height, Channels, Transform, 0);
 
 	delete[] Transform;
 
@@ -88,28 +90,31 @@ static __forceinline HOST_DEVICE unsigned int WangHash(unsigned int seed)
 	return seed;
 }
 
-__global__ void WhiteNoiseGenerator(float* Image)
+__global__ void WhiteNoiseGenerator(int Channels, int Iter, float* Image)
 {
 	int X = blockIdx.x*blockDim.x + threadIdx.x;
 	int Y = blockIdx.y*blockDim.y + threadIdx.y;
 	int Pixel = Y*gridDim.x*blockDim.x + X;
 
-	thrust::default_random_engine Rng(WangHash(Pixel));
+	thrust::default_random_engine Rng(WangHash(Pixel) + WangHash(Iter));
 	thrust::uniform_real_distribution<float> Uniform(0.f, 1.f);
 
-	Image[Pixel] = Uniform(Rng);
+	for (int Index = 0; Index < Channels; ++Index)
+	{
+		Image[Channels*Pixel + Index] = Uniform(Rng);
+	}
 }
 
-void WhiteNoiseGenerator(int Width, int Height, float* Output)
+void WhiteNoiseGenerator(int Width, int Height, int Channels, int Iter, float* Output)
 {
 	float* Image;
-	cudaMalloc(&Image, Width*Height*sizeof(float));
+	cudaMalloc(&Image, Width*Height*Channels*sizeof(float));
 
 	dim3 BlockSize(32, 32);
 	dim3 GridSize(Width / BlockSize.x, Height / BlockSize.y);
-	WhiteNoiseGenerator << <GridSize, BlockSize >> >(Image);
+	WhiteNoiseGenerator << <GridSize, BlockSize >> >(Channels, Iter, Image);
 
-	cudaMemcpy(Output, Image, Width*Height*sizeof(float), cudaMemcpyDeviceToHost);
+	cudaMemcpy(Output, Image, Width*Height*Channels*sizeof(float), cudaMemcpyDeviceToHost);
 }
 // ---------------------White Noise----------------------
 
@@ -369,6 +374,7 @@ void BlueNoiseGenerator(int Width, int Height, float* Image)
 
 	// normalize
 	Normalize << <GridSize, BlockSize >> >(Width, Height, ImageDevice);
+
 	cudaMemcpy(Image, ImageDevice, Width*Height*sizeof(float), cudaMemcpyDeviceToHost);
 
 	// free resources
@@ -383,8 +389,11 @@ void PrintHelp()
 	printf("******************************************************************\n");
 	printf(R"(Options:
 --size <num>          Size of blue or white noise texture need be generated
---output <filename>   Output filename of blue or white noise texture
+--channels <num>      Channels of noise texture (1,2,3,4)
+--output <directory>  Output directory of blue or white noise texture
 --type <num>          Which noise do you want to generate (0: white, 1: blue)
+--frames <num>        Number of textures do you want to generated
+--goldratio <num>     Generate multi textures using goldratio?
 --help                Print help
 )");
 	printf("******************************************************************\n");
@@ -394,9 +403,11 @@ int main(int argc, char** argv)
 {
 	PrintHelp();
 
-	string Filename = "D:/Noise.png";
+	string Base = "D:/";
 	int Width = 64, Height = 64;
 	int Type = 1;
+	int NumFrames = 1, GoldRatio = 1;
+	int NumChannels = 1;
 	for (int Index = 1; Index < argc; ++Index)
 	{
 		if (!strcmp(argv[Index], "--size"))
@@ -405,11 +416,23 @@ int main(int argc, char** argv)
 		}
 		else if (!strcmp(argv[Index], "--output"))
 		{
-			Filename = argv[++Index];
+			Base = argv[++Index];
 		}
 		else if (!strcmp(argv[Index], "--type"))
 		{
 			Type = atoi(argv[++Index]);
+		}
+		else if (!strcmp(argv[Index], "--frames"))
+		{
+			NumFrames = atoi(argv[++Index]);
+		}
+		else if (!strcmp(argv[Index], "--goldratio"))
+		{
+			GoldRatio = atoi(argv[++Index]);
+		}
+		else if (!strcmp(argv[Index], "--channels"))
+		{
+			NumChannels = atoi(argv[++Index]);
 		}
 		else if (!strcmp(argv[Index], "--help"))
 		{
@@ -423,27 +446,52 @@ int main(int argc, char** argv)
 		}
 	}	
 
-	printf("Will generate %snoise with size[%dx%d] and output file[%s]\n", Type == 0 ? "white" : "blue", Width, Height, Filename.c_str());
+	printf("Will generate %d %snoise textures(%d channels) with size[%dx%d] and output directory[%s]\n", NumFrames, Type == 0 ? "white" : "blue", NumChannels, Width, Height, Base.c_str());
 
 	float *Output;
-	Output = new float[Width*Height];
-	for (int Index = 0; Index < Width*Height; ++Index) Output[Index] = 0.f;
+	Output = new float[Width*Height*NumChannels];
+	for (int Index = 0; Index < Width*Height*NumChannels; ++Index) Output[Index] = 0.f;
 
-	Timer Record;
-	Record.Start();
-	if (Type == 0)
+	for (int Frames = 0; Frames < NumFrames; ++Frames)
 	{
-		WhiteNoiseGenerator(Width, Height, Output);
-	}
-	else
-	{
-		BlueNoiseGenerator(Width, Height, Output);
-	}
-	Record.End();
+		Timer Record;
+		Record.Start();
+		if (Frames > 0 && GoldRatio)
+		{
+			const float Ratio = 1.618033; //Gold Ratio
+			for (int Index = 0; Index < Width*Height*NumChannels; ++Index)
+			{
+				Output[Index] += Ratio;
+				Output[Index] -= floor(Output[Index]);
+			}
+		}
+		else
+		{
+			if (Type == 0)
+			{
+				WhiteNoiseGenerator(Width, Height, NumChannels, Frames, Output);
+			}
+			else
+			{
+				vector<float> Temp;
+				Temp.resize(Width*Height);
+				for (int Index = 0; Index < NumChannels; ++Index)
+				{
+					BlueNoiseGenerator(Width, Height, &Temp[0]);
+					for (int Pixel = 0; Pixel < Width*Height; ++Pixel)
+					{
+						Output[NumChannels*Pixel + Index] = Temp[Pixel];
+					}
+				}
+			}
+		}
+		Record.End();
 
-	SavePng(Filename.c_str() , Width, Width, Output);
+		string Filename = Base + "Noise" + to_string(Frames) + ".png";
+		SavePng(Filename.c_str(), Width, Width, NumChannels, Output);
 
-	printf("\nElapsed Time : %f\n", Record.GetElapsed());
+		printf("\nElapsed Time : %f\n", Record.GetElapsed());
+	}
 	delete[] Output;
 
 	return 0;
